@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -61,6 +62,11 @@ var cmd = &cobra.Command{
 			log.Fatal("failed to parse arguments")
 		}
 
+		isSilent, err := cmd.Flags().GetBool("silent")
+		if err != nil {
+			log.Fatal("failed to parse arguments")
+		}
+
 		filename, err := cmd.Flags().GetString("file")
 		if err != nil {
 			log.Fatal("failed to parse arguments")
@@ -79,11 +85,11 @@ var cmd = &cobra.Command{
 		}
 
 		writeChannel := make(chan content, maxParallel*2)
-		defer close(writeChannel)
 
-		var wg sync.WaitGroup
-		if !isGrouped {
-			wg.Add(1)
+		var writerWg sync.WaitGroup
+
+		if !isGrouped || !isSilent {
+			writerWg.Add(1)
 			go func() {
 				for outPrint := range writeChannel {
 					mu.Lock()
@@ -95,7 +101,7 @@ var cmd = &cobra.Command{
 					}
 					mu.Unlock()
 				}
-				wg.Done()
+				writerWg.Done()
 			}()
 		}
 
@@ -108,70 +114,67 @@ var cmd = &cobra.Command{
 			}
 		}()
 
-		for _ = range maxParallel {
+		var sshWg sync.WaitGroup
+		for range min(maxParallel, int8(len(hosts))) {
+			sshWg.Add(1)
 			go func() {
 				host := <-hostChannel
 
-				var hostKey ssh.PublicKey
 				config := ssh.ClientConfig{
 					User: host.username,
 					Auth: []ssh.AuthMethod{
 						ssh.Password(host.password),
 					},
-					HostKeyCallback: ssh.FixedHostKey(hostKey),
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 				}
 
-				client, _ := ssh.Dial("tcp", "", &config)
+				client, err := ssh.Dial("tcp", host.addr, &config)
+				if err != nil {
+					log.Println(err)
+					sshWg.Done()
+					return
+				}
 				defer client.Close()
 
 				session, err := client.NewSession()
 				if err != nil {
-					log.Fatal("Failed to create session: ", err)
+					log.Fatal("Failed to create ssh session: ", err)
 				}
 				defer session.Close()
 
-				lines := []line{}
+				var readWg sync.WaitGroup
+				if !isSilent {
+					readWg.Add(2)
 
-				stdErrPipe, _ := session.StderrPipe()
-				stdErrSc := bufio.NewScanner(stdErrPipe)
-				for stdErrSc.Scan() {
-					if isGrouped {
-						lines = append(lines, line{
-							stderr:  true,
-							content: stdErrSc.Text(),
-						})
-					} else {
-						writeChannel <- content{
-							name:    host.addr,
-							content: stdErrSc.Text(),
-							stderr:  true,
-						}
+					stdErrPipe, err := session.StderrPipe()
+					if err != nil {
+						log.Println(err)
 					}
-				}
+					go readPipe(stdErrPipe, host, isGrouped, writeChannel, &readWg, true)
 
-				stdOutPipe, _ := session.StdoutPipe()
-				stdOutSc := bufio.NewScanner(stdOutPipe)
-				for stdOutSc.Scan() {
-					if isGrouped {
-						lines = append(lines, line{
-							stderr:  false,
-							content: stdOutSc.Text(),
-						})
-					} else {
-						writeChannel <- content{
-							name:    host.addr,
-							content: stdOutSc.Text(),
-							stderr:  false,
-						}
+					stdOutPipe, err := session.StdoutPipe()
+					if err != nil {
+						log.Println(err)
 					}
+					go readPipe(stdOutPipe, host, isGrouped, writeChannel, &readWg, false)
 				}
 
 				session.Run(userCmd)
+
+				readWg.Wait()
+				sshWg.Done()
 			}()
 		}
 
-		if !isGrouped {
-			wg.Wait()
+		sshWg.Wait()
+		close(writeChannel)
+
+		if !isGrouped || !isSilent {
+			writerWg.Wait()
+			return
+		}
+
+		if isSilent {
 			return
 		}
 
@@ -193,6 +196,38 @@ var cmd = &cobra.Command{
 			mu.Unlock()
 		}
 	},
+}
+
+func readPipe(pipe io.Reader, host HostInfo, isGrouped bool, writeChannel chan<- content, wg *sync.WaitGroup, isErr bool) {
+	lines := []line{}
+
+	scanner := bufio.NewScanner(pipe)
+	for scanner.Scan() {
+		if isGrouped {
+			lines = append(lines, line{
+				stderr:  isErr,
+				content: scanner.Text(),
+			})
+		} else {
+			writeChannel <- content{
+				name:    host.addr,
+				content: scanner.Text(),
+				stderr:  isErr,
+			}
+		}
+	}
+
+	prevLines, exists := contentMap.Load(host.addr)
+	if exists {
+		contentMap.Store(
+			host.addr,
+			append(prevLines.([]line), lines...),
+		)
+	} else {
+		contentMap.Store(host.addr, lines)
+	}
+
+	wg.Done()
 }
 
 func parser(filepath string) []HostInfo {
