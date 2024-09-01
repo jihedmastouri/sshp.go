@@ -133,56 +133,64 @@ Note: comments and empty lines are allowed.
 			for _, h := range hosts {
 				hostChannel <- h
 			}
+			close(hostChannel)
 		}()
 
 		var sshWg sync.WaitGroup
 		for range min(maxParallel, int8(len(hosts))) {
 			sshWg.Add(1)
 			go func() {
-				host := <-hostChannel
+			loop:
+				for {
+					select {
+					case host, ok := <-hostChannel:
+						if !ok {
+							break loop
+						}
 
-				config := ssh.ClientConfig{
-					User: host.username,
-					Auth: []ssh.AuthMethod{
-						ssh.Password(host.password),
-					},
-					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				}
+						config := ssh.ClientConfig{
+							User: host.username,
+							Auth: []ssh.AuthMethod{
+								ssh.Password(host.password),
+							},
+							HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+						}
 
-				client, err := ssh.Dial("tcp", host.addr, &config)
-				if err != nil {
-					log.Println(err)
-					sshWg.Done()
-					return
-				}
-				defer client.Close()
+						client, err := ssh.Dial("tcp", host.addr, &config)
+						if err != nil {
+							log.Println(err)
+							sshWg.Done()
+							return
+						}
+						defer client.Close()
 
-				session, err := client.NewSession()
-				if err != nil {
-					log.Fatal("Failed to create ssh session: ", err)
-				}
-				defer session.Close()
+						session, err := client.NewSession()
+						if err != nil {
+							log.Fatal("Failed to create ssh session: ", err)
+						}
+						defer session.Close()
 
-				var readWg sync.WaitGroup
-				if !isSilent {
-					readWg.Add(2)
+						var readWg sync.WaitGroup
+						if !isSilent {
+							readWg.Add(2)
 
-					stdErrPipe, err := session.StderrPipe()
-					if err != nil {
-						log.Println(err)
+							stdErrPipe, err := session.StderrPipe()
+							if err != nil {
+								log.Println(err)
+							}
+							go readPipe(stdErrPipe, host, isGrouped, writeChannel, &readWg, true)
+
+							stdOutPipe, err := session.StdoutPipe()
+							if err != nil {
+								log.Println(err)
+							}
+							go readPipe(stdOutPipe, host, isGrouped, writeChannel, &readWg, false)
+						}
+
+						session.Run(userCmd)
+						readWg.Wait()
 					}
-					go readPipe(stdErrPipe, host, isGrouped, writeChannel, &readWg, true)
-
-					stdOutPipe, err := session.StdoutPipe()
-					if err != nil {
-						log.Println(err)
-					}
-					go readPipe(stdOutPipe, host, isGrouped, writeChannel, &readWg, false)
 				}
-
-				session.Run(userCmd)
-
-				readWg.Wait()
 				sshWg.Done()
 			}()
 		}
