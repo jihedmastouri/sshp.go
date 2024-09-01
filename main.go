@@ -47,9 +47,31 @@ var (
 )
 
 var cmd = &cobra.Command{
-	Use:       "sshp",
-	Short:     "SSH Parallel",
-	Example:   "sshp echo hello",
+	Use:   "sshp",
+	Short: "SSH Parallel",
+	Long: `sshp (SSH Parallel) allows you to run a command on multiple machines at the same time throw ssh.
+hosts file structure:
+	<addr:port> <password> <username>
+Note: comments and empty lines are allowed.
+	`,
+	Example: "sshp -- ls -a / sshp echo hello",
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		isGrouped, err := cmd.Flags().GetBool("join")
+		if err != nil {
+			log.Fatal("failed to parse arguments")
+		}
+
+		isSilent, err := cmd.Flags().GetBool("silent")
+		if err != nil {
+			log.Fatal("failed to parse arguments")
+		}
+
+		if isSilent && isGrouped {
+			return fmt.Errorf("You cannot have --join and --silent together")
+		}
+
+		return nil
+	},
 	ValidArgs: []string{"command"},
 	Run: func(cmd *cobra.Command, args []string) {
 		maxParallel, err := cmd.Flags().GetInt8("max-parallel")
@@ -85,7 +107,6 @@ var cmd = &cobra.Command{
 		}
 
 		writeChannel := make(chan content, maxParallel*2)
-
 		var writerWg sync.WaitGroup
 
 		if !isGrouped || !isSilent {
@@ -169,7 +190,7 @@ var cmd = &cobra.Command{
 		sshWg.Wait()
 		close(writeChannel)
 
-		if !isGrouped || !isSilent {
+		if !isGrouped && !isSilent {
 			writerWg.Wait()
 			return
 		}
@@ -178,14 +199,9 @@ var cmd = &cobra.Command{
 			return
 		}
 
-		for _, h := range hosts {
+		contentMap.Range(func(k, v interface{}) bool {
 			mu.Lock()
-			v, ok := contentMap.Load(h.addr)
-			green.Printf("[%s]:\n", h.addr)
-			if !ok {
-				red.Println("<sshp: Failed to read output of the command>")
-				continue
-			}
+			green.Printf("[%s]:\n", k)
 			for _, l := range v.([]line) {
 				if l.stderr {
 					red.Println(l.content)
@@ -194,7 +210,9 @@ var cmd = &cobra.Command{
 				}
 			}
 			mu.Unlock()
-		}
+			return true
+		})
+
 	},
 }
 
