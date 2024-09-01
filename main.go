@@ -1,8 +1,6 @@
 package main
 
 import (
-	// "golang.org/x/term"
-	// "golang.org/x/crypto/ssh"
 	"bufio"
 	"fmt"
 	"log"
@@ -13,13 +11,15 @@ import (
 	"sync"
 	"syscall"
 
+	ssh "golang.org/x/crypto/ssh"
+
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
 
 var (
 	mu         sync.Mutex
-	contentMap map[string][]line
+	contentMap sync.Map
 )
 
 type content struct {
@@ -34,7 +34,9 @@ type line struct {
 }
 
 type HostInfo struct {
-	addr string
+	addr     string
+	password string
+	username string
 }
 
 var (
@@ -98,9 +100,75 @@ var cmd = &cobra.Command{
 		}
 
 		hosts := parser(filename)
-		/*
-		 * TODO: SSH Logic
-		 */
+		hostChannel := make(chan HostInfo, 1)
+
+		go func() {
+			for _, h := range hosts {
+				hostChannel <- h
+			}
+		}()
+
+		for _ = range maxParallel {
+			go func() {
+				host := <-hostChannel
+
+				var hostKey ssh.PublicKey
+				config := ssh.ClientConfig{
+					User: host.username,
+					Auth: []ssh.AuthMethod{
+						ssh.Password(host.password),
+					},
+					HostKeyCallback: ssh.FixedHostKey(hostKey),
+				}
+
+				client, _ := ssh.Dial("tcp", "", &config)
+				defer client.Close()
+
+				session, err := client.NewSession()
+				if err != nil {
+					log.Fatal("Failed to create session: ", err)
+				}
+				defer session.Close()
+
+				lines := []line{}
+
+				stdErrPipe, _ := session.StderrPipe()
+				stdErrSc := bufio.NewScanner(stdErrPipe)
+				for stdErrSc.Scan() {
+					if isGrouped {
+						lines = append(lines, line{
+							stderr:  true,
+							content: stdErrSc.Text(),
+						})
+					} else {
+						writeChannel <- content{
+							name:    host.addr,
+							content: stdErrSc.Text(),
+							stderr:  true,
+						}
+					}
+				}
+
+				stdOutPipe, _ := session.StdoutPipe()
+				stdOutSc := bufio.NewScanner(stdOutPipe)
+				for stdOutSc.Scan() {
+					if isGrouped {
+						lines = append(lines, line{
+							stderr:  false,
+							content: stdOutSc.Text(),
+						})
+					} else {
+						writeChannel <- content{
+							name:    host.addr,
+							content: stdOutSc.Text(),
+							stderr:  false,
+						}
+					}
+				}
+
+				session.Run(userCmd)
+			}()
+		}
 
 		if !isGrouped {
 			wg.Wait()
@@ -108,19 +176,21 @@ var cmd = &cobra.Command{
 		}
 
 		for _, h := range hosts {
-			v, ok := contentMap[h.addr]
+			mu.Lock()
+			v, ok := contentMap.Load(h.addr)
 			green.Printf("[%s]:\n", h.addr)
 			if !ok {
 				red.Println("<sshp: Failed to read output of the command>")
 				continue
 			}
-			for _, l := range v {
+			for _, l := range v.([]line) {
 				if l.stderr {
 					red.Println(l.content)
 				} else {
 					fmt.Println(l.content)
 				}
 			}
+			mu.Unlock()
 		}
 	},
 }
@@ -139,7 +209,11 @@ func parser(filepath string) []HostInfo {
 			continue
 		}
 
-		host := HostInfo{l}
+		infos := strings.Split(l, " ")
+		if len(infos) != 3 {
+			continue
+		}
+		host := HostInfo{infos[0], infos[1], infos[2]}
 		hosts = append(hosts, host)
 	}
 
@@ -169,8 +243,9 @@ func askForConfirmation(s string) bool {
 
 func main() {
 	cmd.Flags().Int8P("max-parallel", "m", 16, "The maximum allowed number for parallel ssh sessions")
-	cmd.Flags().StringP("file", "f", "", "the file containing host mechine")
-	cmd.Flags().BoolP("join", "j", false, "weither to print each line as it comes or group per host based")
+	cmd.Flags().StringP("file", "f", "", "The file containing host mechine")
+	cmd.Flags().BoolP("join", "j", false, "Weither to print each line as it comes or group per host based")
+	cmd.Flags().BoolP("silent", "s", false, "Work in slience. No Output will be shown.")
 
 	done := make(chan struct{})
 
